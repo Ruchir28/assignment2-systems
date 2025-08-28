@@ -51,9 +51,57 @@ class FlashAttention2(torch.autograd.Function):
 
             L[:,qs:qe] = max_running_score + torch.log(l)
 
-        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.save_for_backward(L, Q, K, V, O, q_scaled)
         return O
 
     @staticmethod
-    def backward(ctx, grad_output):
-        pass
+    def backward(ctx, dO: torch.Tensor):
+
+        L, Q, K, V, O, q_scaled = ctx.saved_tensors
+
+        B, Nq, D = Q.shape
+        
+        Nk = K.shape[1]
+        
+        device, dtype = Q.device, Q.dtype
+        BQ = 64
+        BK = 64
+
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+
+        D = torch.sum(dO * O, dim=-1) #(B,Nq)
+
+
+        for ks in range(0,Nk,BK):
+            ke = min(ks + BK,Nk)
+            k_j = K[:,ks:ke,:] #(B,bk,D)
+            v_j = V[:,ks:ke,:] #(B,bk,D)
+            dK_j = torch.zeros_like(k_j)
+            dV_j = torch.zeros_like(v_j)
+            
+            for qs in range(0,Nq,BQ):
+                qe = min(qs + BQ,Nq)
+                q_i = q_scaled[:,qs:qe,:]
+                o_i = O[:,qs:qe,:]
+                dO_i = dO[:,qs:qe,:] # (B,bq,D)
+                dQ_i = torch.zeros_like(q_i) # (B,bq,D)
+                L_i = L[:,qs:qe] # (B,bq)
+                D_i = D[:,qs:qe] # (B,bq)
+
+                S_ij = torch.matmul(q_i, k_j.transpose(-1,-2)) #(B,bq,bk)
+                P_ij = torch.exp(S_ij - L_i[...,None]) #(B,bq,bk)
+                dV_j += torch.einsum('bqk,bqd->bkd', P_ij, dO_i) #(B,bk,D)
+                dP_ij = torch.einsum('bqd,bkd->bqk', dO_i, v_j) #(B,bq,bk)
+                dS_ij = P_ij * (dP_ij - D_i[...,None]) #(B,bq,bk)
+
+                dQ_i += (1/math.sqrt(Q.shape[-1])) * torch.matmul(dS_ij, k_j) #(B,bq,D)
+                dQ[:,qs:qe,:] += dQ_i
+
+                dK_j += torch.matmul(dS_ij.transpose(-1,-2), q_i) #(B,bk,D)\
+
+            dK[:,ks:ke,:] += dK_j
+            dV[:,ks:ke,:] += dV_j
+
+        return dQ, dK, dV, None
